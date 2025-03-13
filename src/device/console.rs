@@ -144,6 +144,16 @@ impl<H: Hal, T: Transport> VirtIOConsole<H, T> {
         self.finish_receive()
     }
 
+    /// Enables interrupts from the device.
+    pub fn enable_interrupts(&mut self) {
+        self.receiveq.set_dev_notify(true);
+    }
+
+    /// Disables interrupts from the device.
+    pub fn disable_interrupts(&mut self) {
+        self.receiveq.set_dev_notify(false);
+    }
+
     /// If there is an outstanding receive request and it has finished, completes it.
     ///
     /// Returns true if new data has been received.
