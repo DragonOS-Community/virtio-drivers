@@ -49,6 +49,12 @@
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
+#[cfg(feature = "fake-log")]
+extern crate fake_log as log;
+
+#[cfg(feature = "log")]
+extern crate log;
+
 pub mod device;
 mod hal;
 mod queue;

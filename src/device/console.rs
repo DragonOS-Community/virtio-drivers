@@ -7,6 +7,8 @@ use crate::volatile::{volread, ReadOnly, WriteOnly};
 use crate::{Result, PAGE_SIZE};
 use alloc::boxed::Box;
 use bitflags::bitflags;
+use alloc::vec;
+use core::convert::TryInto;
 use core::ptr::NonNull;
 
 const QUEUE_RECEIVEQ_PORT_0: u16 = 0;
@@ -83,7 +85,7 @@ impl<H: Hal, T: Transport> VirtIOConsole<H, T> {
         // Safe because no alignment or initialisation is required for [u8], the DMA buffer is
         // dereferenceable, and the lifetime of the reference matches the lifetime of the DMA buffer
         // (which we don't otherwise access).
-        let queue_buf_rx = Box::new([0; PAGE_SIZE]);
+        let queue_buf_rx: Box<[u8; 4096]> = vec![0u8; PAGE_SIZE].into_boxed_slice().try_into().unwrap();
 
         transport.finish_init();
         let mut console = VirtIOConsole {
