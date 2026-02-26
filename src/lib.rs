@@ -51,7 +51,8 @@ extern crate alloc;
 
 pub mod device;
 mod hal;
-mod queue;
+/// Virtqueue implementation used by virtio device drivers.
+pub mod queue;
 pub mod transport;
 mod volatile;
 
