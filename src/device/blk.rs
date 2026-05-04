@@ -153,6 +153,57 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         }
     }
 
+    /// Returns true if the device supports flushing pending writes to storage.
+    pub fn supports_flush(&self) -> bool {
+        self.negotiated_features.contains(BlkFeature::FLUSH)
+    }
+
+    /// Submits a flush request, but returns immediately without waiting for it to complete.
+    ///
+    /// Returns `Ok(None)` if the device doesn't support `VIRTIO_BLK_F_FLUSH`, matching
+    /// [`Self::flush`]'s no-op behavior in that case.
+    ///
+    /// # Safety
+    ///
+    /// `req` and `resp` are still borrowed by the underlying VirtIO block device even after this
+    /// method returns `Some(token)`. Thus, it is the caller's responsibility to guarantee that they
+    /// are not accessed before the request is completed in order to avoid data races.
+    pub unsafe fn flush_nb(&mut self, req: &mut BlkReq, resp: &mut BlkResp) -> Result<Option<u16>> {
+        if !self.supports_flush() {
+            return Ok(None);
+        }
+
+        *req = BlkReq {
+            type_: ReqType::Flush,
+            ..Default::default()
+        };
+        let token = self
+            .queue
+            .add(&[req.as_bytes()], &mut [resp.as_bytes_mut()])?;
+        if self.queue.should_notify() {
+            self.transport.notify(QUEUE);
+        }
+
+        Ok(Some(token))
+    }
+
+    /// Completes a flush operation which was started by [`Self::flush_nb`].
+    ///
+    /// # Safety
+    ///
+    /// The same buffers must be passed in again as were passed to [`Self::flush_nb`] when it
+    /// returned the token.
+    pub unsafe fn complete_flush(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        resp: &mut BlkResp,
+    ) -> Result<()> {
+        self.queue
+            .pop_used(token, &[req.as_bytes()], &mut [resp.as_bytes_mut()])?;
+        resp.status.into()
+    }
+
     /// Gets the device ID.
     ///
     /// The ID is written as ASCII into the given buffer, which must be 20 bytes long, and the used

@@ -238,7 +238,7 @@ impl PciRoot {
     }
 
     /// Gets an iterator over the capabilities of the given device function.
-    pub fn capabilities(&self, device_function: DeviceFunction) -> CapabilityIterator {
+    pub fn capabilities(&self, device_function: DeviceFunction) -> CapabilityIterator<'_> {
         CapabilityIterator {
             root: self,
             device_function,
