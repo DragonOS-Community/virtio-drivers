@@ -12,7 +12,7 @@ use core::hint::spin_loop;
 use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
-use core::ptr::NonNull;
+use core::ptr::{addr_of_mut, NonNull};
 use core::sync::atomic::{fence, AtomicU16, Ordering};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -134,6 +134,86 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             #[cfg(feature = "alloc")]
             indirect_lists: [NONE; SIZE],
         })
+    }
+
+    /// Creates a new VirtQueue directly on the heap.
+    ///
+    /// This avoids placing the full `VirtQueue` value on the caller's stack, which matters for
+    /// large queue sizes because the queue contains descriptor shadow arrays sized by `SIZE`.
+    #[cfg(feature = "alloc")]
+    pub fn new_boxed<T: Transport>(
+        transport: &mut T,
+        idx: u16,
+        indirect: bool,
+        event_idx: bool,
+    ) -> Result<Box<Self>> {
+        if transport.queue_used(idx) {
+            return Err(Error::AlreadyUsed);
+        }
+        if !SIZE.is_power_of_two()
+            || SIZE > u16::MAX.into()
+            || transport.max_queue_size(idx) < SIZE as u32
+        {
+            return Err(Error::InvalidParam);
+        }
+        let size = SIZE as u16;
+
+        let layout = if transport.requires_legacy_layout() {
+            VirtQueueLayout::allocate_legacy(size)?
+        } else {
+            VirtQueueLayout::allocate_flexible(size)?
+        };
+
+        transport.queue_set(
+            idx,
+            size.into(),
+            layout.descriptors_paddr(),
+            layout.driver_area_paddr(),
+            layout.device_area_paddr(),
+        );
+
+        let desc =
+            nonnull_slice_from_raw_parts(layout.descriptors_vaddr().cast::<Descriptor>(), SIZE);
+        let avail = layout.avail_vaddr().cast();
+        let used = layout.used_vaddr().cast();
+
+        let mut boxed = Box::<Self>::new_uninit();
+        let queue = boxed.as_mut_ptr();
+
+        // SAFETY: `queue` points to a heap allocation for `Self`. Each field is initialized
+        // exactly once below before `assume_init`, and no initialized field is read before then.
+        unsafe {
+            addr_of_mut!((*queue).layout).write(layout);
+            addr_of_mut!((*queue).desc).write(desc);
+            addr_of_mut!((*queue).avail).write(avail);
+            addr_of_mut!((*queue).used).write(used);
+            addr_of_mut!((*queue).queue_idx).write(idx);
+            addr_of_mut!((*queue).num_used).write(0);
+            addr_of_mut!((*queue).free_head).write(0);
+
+            let desc_shadow = addr_of_mut!((*queue).desc_shadow) as *mut Descriptor;
+            for i in 0..SIZE {
+                let mut shadow: Descriptor = FromZeroes::new_zeroed();
+                if i + 1 < SIZE {
+                    shadow.next = (i + 1) as u16;
+                    (*desc.as_ptr())[i].next = (i + 1) as u16;
+                }
+                desc_shadow.add(i).write(shadow);
+            }
+
+            addr_of_mut!((*queue).avail_idx).write(0);
+            addr_of_mut!((*queue).last_used_idx).write(0);
+            addr_of_mut!((*queue).event_idx).write(event_idx);
+            addr_of_mut!((*queue).indirect).write(indirect);
+
+            let indirect_lists =
+                addr_of_mut!((*queue).indirect_lists) as *mut Option<NonNull<[Descriptor]>>;
+            for i in 0..SIZE {
+                indirect_lists.add(i).write(None);
+            }
+
+            Ok(boxed.assume_init())
+        }
     }
 
     /// Add buffers to the virtqueue, return a token.
@@ -481,6 +561,35 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 panic!("Descriptor chain was longer than expected.");
             }
         }
+    }
+
+    /// Recycles a descriptor chain that will never appear in the used ring.
+    ///
+    /// This is intended for driver teardown after the caller has reset the device and confirmed
+    /// that it can no longer access the queue. It is not a replacement for `pop_used` on the normal
+    /// completion path.
+    ///
+    /// # Safety
+    ///
+    /// The device must have stopped accessing the queue, and the buffers in `inputs` and `outputs`
+    /// must match the set of buffers originally added to the queue by `add` when it returned
+    /// `token`.
+    pub unsafe fn detach_unused<'a>(
+        &mut self,
+        token: u16,
+        inputs: &'a [&'a [u8]],
+        outputs: &'a mut [&'a mut [u8]],
+    ) -> Result<()> {
+        if usize::from(token) >= SIZE {
+            return Err(Error::InvalidParam);
+        }
+
+        // SAFETY: The caller guarantees the device is no longer accessing the queue and the
+        // buffers match the descriptor chain identified by `token`.
+        unsafe {
+            self.recycle_descriptors(token, inputs, outputs);
+        }
+        Ok(())
     }
 
     /// If the given token is next on the device used queue, pops it and returns the total buffer
