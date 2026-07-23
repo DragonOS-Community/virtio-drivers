@@ -12,7 +12,9 @@ use core::hint::spin_loop;
 use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
-use core::ptr::{addr_of_mut, NonNull};
+#[cfg(feature = "alloc")]
+use core::ptr::addr_of_mut;
+use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicU16, Ordering};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -54,6 +56,12 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     last_used_idx: u16,
     /// Whether the `VIRTIO_F_EVENT_IDX` feature has been negotiated.
     event_idx: bool,
+    /// Whether device-to-driver used-buffer notifications are enabled.
+    ///
+    /// With EVENT_IDX negotiated, consuming a used entry advances
+    /// `used_event` only while this is true. Otherwise pop_used() would
+    /// accidentally undo NAPI's notification suppression mid-poll.
+    dev_notify_enabled: bool,
     #[cfg(feature = "alloc")]
     indirect: bool,
     #[cfg(feature = "alloc")]
@@ -74,6 +82,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         indirect: bool,
         event_idx: bool,
     ) -> Result<Self> {
+        #[cfg(not(feature = "alloc"))]
+        let _ = indirect;
         if transport.queue_used(idx) {
             return Err(Error::AlreadyUsed);
         }
@@ -129,6 +139,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             avail_idx: 0,
             last_used_idx: 0,
             event_idx,
+            dev_notify_enabled: true,
             #[cfg(feature = "alloc")]
             indirect,
             #[cfg(feature = "alloc")]
@@ -399,16 +410,59 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     ///
     /// See Virtio v1.1 2.6.7 Used Buffer Notification Suppression
     pub fn set_dev_notify(&mut self, enable: bool) {
-        let avail_ring_flags = if enable { 0x0000 } else { 0x0001 };
-        if !self.event_idx {
+        if enable {
+            let _ = self.enable_dev_notify_prepare();
+        } else if self.event_idx {
+            self.dev_notify_enabled = false;
+            // Ask the device not to interrupt for the next used entry. This is
+            // the EVENT_IDX equivalent of setting VRING_AVAIL_F_NO_INTERRUPT.
+            unsafe {
+                (*self.avail.as_ptr())
+                    .used_event
+                    .store(self.last_used_idx.wrapping_sub(1), Ordering::Release)
+            }
+        } else {
+            self.dev_notify_enabled = false;
             // Safe because self.avail points to a valid, aligned, initialised, dereferenceable, readable
             // instance of AvailRing.
             unsafe {
                 (*self.avail.as_ptr())
                     .flags
-                    .store(avail_ring_flags, Ordering::Release)
+                    .store(0x0001, Ordering::Release)
             }
         }
+    }
+
+    /// Enable used-buffer notifications and return the current driver-owned
+    /// used index for a subsequent race-closing check.
+    ///
+    /// The caller must pass the returned value to [`Self::dev_notify_pending`]
+    /// before trusting that no work arrived during notification enablement.
+    pub fn enable_dev_notify_prepare(&mut self) -> u16 {
+        self.dev_notify_enabled = true;
+        if self.event_idx {
+            unsafe {
+                (*self.avail.as_ptr())
+                    .used_event
+                    .store(self.last_used_idx, Ordering::Release)
+            }
+        } else {
+            unsafe {
+                (*self.avail.as_ptr())
+                    .flags
+                    .store(0x0000, Ordering::Release)
+            }
+        }
+        self.last_used_idx
+    }
+
+    /// Check whether a used buffer arrived after notifications were enabled.
+    ///
+    /// The full barrier pairs the driver notification write with the following
+    /// device-owned used-index read, matching the virtqueue enable/poll protocol.
+    pub fn dev_notify_pending(&self, prepared_used_idx: u16) -> bool {
+        fence(Ordering::SeqCst);
+        prepared_used_idx != unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) }
     }
 
     /// Returns whether the driver should notify the device after adding a new buffer to the
@@ -449,11 +503,21 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     /// Returns the descriptor index (a.k.a. token) of the next used element without popping it, or
     /// `None` if the used ring is empty.
     pub fn peek_used(&self) -> Option<u16> {
+        self.peek_used_id()
+            .and_then(|id| (id <= u16::MAX.into()).then_some(id as u16))
+    }
+
+    /// Returns the untrusted descriptor ID of the next used element without
+    /// narrowing the device-provided `u32` value.
+    ///
+    /// Device drivers which form memory-safety decisions from the token should
+    /// validate this value against their queue size before converting it.
+    pub fn peek_used_id(&self) -> Option<u32> {
         if self.can_pop() {
             let last_used_slot = self.last_used_idx & (SIZE as u16 - 1);
             // Safe because self.used points to a valid, aligned, initialised, dereferenceable,
             // readable instance of UsedRing.
-            Some(unsafe { (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16 })
+            Some(unsafe { (*self.used.as_ptr()).ring[last_used_slot as usize].id })
         } else {
             None
         }
@@ -613,15 +677,19 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
 
         // Get the index of the start of the descriptor chain for the next element in the used ring.
         let last_used_slot = self.last_used_idx & (SIZE as u16 - 1);
-        let index;
+        let device_index;
         let len;
         // Safe because self.used points to a valid, aligned, initialised, dereferenceable, readable
         // instance of UsedRing.
         unsafe {
-            index = (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16;
+            device_index = (*self.used.as_ptr()).ring[last_used_slot as usize].id;
             len = (*self.used.as_ptr()).ring[last_used_slot as usize].len;
         }
 
+        if device_index >= SIZE as u32 {
+            return Err(Error::IoError);
+        }
+        let index = device_index as u16;
         if index != token {
             // The device used a different descriptor chain to the one we were expecting.
             return Err(Error::WrongToken);
@@ -633,7 +701,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         }
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
-        if self.event_idx {
+        if self.event_idx && self.dev_notify_enabled {
             unsafe {
                 (*self.avail.as_ptr())
                     .used_event
@@ -1284,6 +1352,126 @@ mod tests {
             unsafe { (*queue.avail.as_ptr()).flags.load(Ordering::Acquire) },
             0x0
         );
+
+        let prepared = queue.enable_dev_notify_prepare();
+        assert_eq!(prepared, 0);
+        assert!(!queue.dev_notify_pending(prepared));
+
+        // Model one device completion between callback enablement and the
+        // driver's race-closing check.
+        unsafe {
+            (*queue.used.as_ptr()).ring[0].id = u16::MAX as u32 + 1;
+            (*queue.used.as_ptr()).idx.store(1, Ordering::Release);
+        }
+        assert!(queue.dev_notify_pending(prepared));
+        assert_eq!(queue.peek_used_id(), Some(u16::MAX as u32 + 1));
+        assert_eq!(queue.peek_used(), None);
+    }
+
+    /// Tests notification disable/enable semantics with EVENT_IDX negotiated.
+    #[test]
+    fn set_dev_notify_event_idx() {
+        let mut config_space = ();
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let mut transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: 4,
+            device_features: 0,
+            config_space: NonNull::from(&mut config_space),
+            state,
+        };
+        let mut queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, true).unwrap();
+
+        queue.set_dev_notify(false);
+        assert_eq!(
+            unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) },
+            u16::MAX
+        );
+
+        let prepared = queue.enable_dev_notify_prepare();
+        assert_eq!(prepared, 0);
+        assert_eq!(
+            unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) },
+            0
+        );
+        assert!(!queue.dev_notify_pending(prepared));
+
+        unsafe {
+            (*queue.used.as_ptr()).idx.store(1, Ordering::Release);
+        }
+        assert!(queue.dev_notify_pending(prepared));
+    }
+
+    /// Consuming completions while NAPI-style notification suppression is
+    /// active must not advance used_event and reopen the interrupt stream.
+    #[test]
+    fn pop_used_preserves_event_idx_suppression() {
+        let mut config_space = ();
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let mut transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: 4,
+            device_features: 0,
+            config_space: NonNull::from(&mut config_space),
+            state,
+        };
+        let mut queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, true).unwrap();
+        let mut output = [0u8; 4];
+        let token = unsafe { queue.add(&[], &mut [&mut output]) }.unwrap();
+        unsafe {
+            (*queue.used.as_ptr()).ring[0].id = token as u32;
+            (*queue.used.as_ptr()).ring[0].len = output.len() as u32;
+            (*queue.used.as_ptr()).idx.store(1, Ordering::Release);
+        }
+
+        queue.set_dev_notify(false);
+        assert_eq!(
+            unsafe { queue.pop_used(token, &[], &mut [&mut output]) }.unwrap(),
+            output.len() as u32
+        );
+        assert_eq!(
+            unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) },
+            u16::MAX
+        );
+    }
+
+    /// The full device-provided u32 ID consumed by pop_used must be validated
+    /// before it is narrowed to the driver's u16 descriptor token.
+    #[test]
+    fn pop_used_rejects_out_of_range_device_id() {
+        let mut config_space = ();
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let mut transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: 4,
+            device_features: 0,
+            config_space: NonNull::from(&mut config_space),
+            state,
+        };
+        let mut queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, true).unwrap();
+        let mut output = [0u8; 4];
+        let token = unsafe { queue.add(&[], &mut [&mut output]) }.unwrap();
+        unsafe {
+            (*queue.used.as_ptr()).ring[0].id = u16::MAX as u32 + 1;
+            (*queue.used.as_ptr()).ring[0].len = output.len() as u32;
+            (*queue.used.as_ptr()).idx.store(1, Ordering::Release);
+        }
+
+        assert_eq!(
+            unsafe { queue.pop_used(token, &[], &mut [&mut output]) }.unwrap_err(),
+            Error::IoError
+        );
+        assert_eq!(queue.last_used_idx, 0);
+        assert_eq!(queue.available_desc(), 3);
     }
 
     /// Tests that the queue notifies the device about added buffers, if it hasn't suppressed

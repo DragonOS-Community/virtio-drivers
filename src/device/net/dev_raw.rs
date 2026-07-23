@@ -5,6 +5,8 @@ use crate::queue::VirtQueue;
 use crate::transport::Transport;
 use crate::volatile::volread;
 use crate::{Error, Result};
+#[cfg(feature = "alloc")]
+use alloc::boxed::Box;
 use log::{debug, info, warn};
 use zerocopy::AsBytes;
 
@@ -19,8 +21,24 @@ use zerocopy::AsBytes;
 pub struct VirtIONetRaw<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
     transport: T,
     mac: EthernetAddress,
+    #[cfg(feature = "alloc")]
+    recv_queue: Box<VirtQueue<H, QUEUE_SIZE>>,
+    #[cfg(not(feature = "alloc"))]
     recv_queue: VirtQueue<H, QUEUE_SIZE>,
+    #[cfg(feature = "alloc")]
+    send_queue: Box<VirtQueue<H, QUEUE_SIZE>>,
+    #[cfg(not(feature = "alloc"))]
     send_queue: VirtQueue<H, QUEUE_SIZE>,
+}
+
+/// Queue positions captured while enabling device-to-driver notifications.
+///
+/// Pass this value to [`VirtIONetRaw::interrupt_pending`] immediately after
+/// enabling notifications to close the disable/poll/enable race.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptState {
+    receive_used_idx: u16,
+    transmit_used_idx: u16,
 }
 
 impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZE> {
@@ -40,12 +58,28 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
                 volread!(config, status)
             );
         }
+        #[cfg(feature = "alloc")]
+        let send_queue = VirtQueue::new_boxed(
+            &mut transport,
+            QUEUE_TRANSMIT,
+            false,
+            negotiated_features.contains(Features::RING_EVENT_IDX),
+        )?;
+        #[cfg(not(feature = "alloc"))]
         let send_queue = VirtQueue::new(
             &mut transport,
             QUEUE_TRANSMIT,
             false,
             negotiated_features.contains(Features::RING_EVENT_IDX),
         )?;
+        #[cfg(feature = "alloc")]
+        let recv_queue = VirtQueue::new_boxed(
+            &mut transport,
+            QUEUE_RECEIVE,
+            false,
+            negotiated_features.contains(Features::RING_EVENT_IDX),
+        )?;
+        #[cfg(not(feature = "alloc"))]
         let recv_queue = VirtQueue::new(
             &mut transport,
             QUEUE_RECEIVE,
@@ -76,8 +110,26 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
 
     /// Enable interrupts.
     pub fn enable_interrupts(&mut self) {
-        self.send_queue.set_dev_notify(true);
-        self.recv_queue.set_dev_notify(true);
+        let _ = self.enable_interrupts_prepare();
+    }
+
+    /// Enable interrupts and capture the queue positions used for the
+    /// subsequent race-closing check.
+    pub fn enable_interrupts_prepare(&mut self) -> InterruptState {
+        InterruptState {
+            receive_used_idx: self.recv_queue.enable_dev_notify_prepare(),
+            transmit_used_idx: self.send_queue.enable_dev_notify_prepare(),
+        }
+    }
+
+    /// Return whether either queue gained a used buffer while interrupts were
+    /// being enabled.
+    ///
+    /// This method includes the full memory barrier required between publishing
+    /// the notification request and rereading the device-owned used indices.
+    pub fn interrupt_pending(&self, state: InterruptState) -> bool {
+        self.recv_queue.dev_notify_pending(state.receive_used_idx)
+            || self.send_queue.dev_notify_pending(state.transmit_used_idx)
     }
 
     /// Get MAC address.
@@ -162,6 +214,12 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
         self.send_queue.peek_used()
     }
 
+    /// Like [`Self::poll_transmit`], but rejects a device-provided descriptor
+    /// ID which is outside this queue instead of narrowing it.
+    pub fn poll_transmit_checked(&self) -> Result<Option<u16>> {
+        Self::checked_used_token(self.send_queue.peek_used_id())
+    }
+
     /// Completes a transmission operation which was started by [`transmit_begin`].
     /// Returns number of bytes transmitted.
     ///
@@ -212,6 +270,20 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     /// there are no pending completed requests it returns [`None`].
     pub fn poll_receive(&self) -> Option<u16> {
         self.recv_queue.peek_used()
+    }
+
+    /// Like [`Self::poll_receive`], but rejects a device-provided descriptor ID
+    /// which is outside this queue instead of narrowing it.
+    pub fn poll_receive_checked(&self) -> Result<Option<u16>> {
+        Self::checked_used_token(self.recv_queue.peek_used_id())
+    }
+
+    fn checked_used_token(id: Option<u32>) -> Result<Option<u16>> {
+        match id {
+            None => Ok(None),
+            Some(id) if id < QUEUE_SIZE as u32 => Ok(Some(id as u16)),
+            Some(_) => Err(Error::IoError),
+        }
     }
 
     /// Completes a transmission operation which was started by [`receive_begin`].
